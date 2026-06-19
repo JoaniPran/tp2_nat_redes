@@ -37,7 +37,7 @@ class ProtoRouter(object):
         self.ip_to_port = {}
         self.nat_saliente = {}      # (protocol, ip_priv, port_priv, ip_dst, port_dst) -> port_pub
         self.nat_entrante = {}      # (protocol, port_pub, ip_dst, port_dst) -> (ip_priv, port_priv)
-        self.proximo_puerto_publico = 50000 # creo que a partir del 49152 son libres
+        self.proximo_puerto_publico = 1024
         connection.addListeners(self)
 
     def enviar_paquete_ip(self, packet, src_mac, dst_mac, out_port):
@@ -52,11 +52,11 @@ class ProtoRouter(object):
 
     def obtener_prox_puerto(self, protocol, dst_ip, dst_port):
         # Buscamos un puerto libre a partir de proximo_puerto_publico
-        for _ in range(65536 - 50000):
+        for _ in range(65536 - 1024):
             puerto = self.proximo_puerto_publico
             self.proximo_puerto_publico += 1
             if self.proximo_puerto_publico > 65535:
-                self.proximo_puerto_publico = 50000
+                self.proximo_puerto_publico = 1024
             
             # Si el puerto no está en uso para este protocolo y destino específico, lo devolvemos
             if (protocol, puerto, dst_ip, dst_port) not in self.nat_entrante:
@@ -100,6 +100,9 @@ class ProtoRouter(object):
         fm.actions.append(of.ofp_action_dl_addr.set_dst(mac_pub_dst))
         fm.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
         self.connection.send(fm)
+        
+        proto_str = "TCP" if protocol == ipv4.TCP_PROTOCOL else "UDP" if protocol == ipv4.UDP_PROTOCOL else str(protocol)
+        log_color(GREEN, f"[SWITCH] Regla de salida instalada ({proto_str}): {ip_priv}:{port_priv} -> {ip_pub_dst}:{port_pub_dst} | Traducido a: {PUBLIC_IP}:{pub_port}")
 
     def instalar_flujo_entrante(self, protocol, ip_priv, port_priv, ip_pub_dst, port_pub_dst, pub_port, mac_priv, port_priv_sw):
         fm = of.ofp_flow_mod()
@@ -126,18 +129,19 @@ class ProtoRouter(object):
         fm.actions.append(of.ofp_action_output(port=port_priv_sw))
         self.connection.send(fm)
 
+        proto_str = "TCP" if protocol == ipv4.TCP_PROTOCOL else "UDP" if protocol == ipv4.UDP_PROTOCOL else str(protocol)
+        log_color(GREEN, f"[SWITCH] Regla de entrada instalada ({proto_str}): {ip_pub_dst}:{port_pub_dst} -> {PUBLIC_IP}:{pub_port} | Mapeado a: {ip_priv}:{port_priv}")
+
     def handle_ip(self, event):
         packet = event.parsed
         ip_pkt = packet.payload
         in_port = event.port
 
-        log_color(
-            YELLOW, f"RECIBIDO: {ip_pkt.srcip} → {ip_pkt.dstip} | "
-            f"MAC: {packet.src} → {packet.dst} | In Port: {in_port}")
+        log_color(YELLOW, f"[IP] Recibido: {ip_pkt.srcip} -> {ip_pkt.dstip} (Puerto de entrada: {in_port})")
 
         # Evitar procesar paquetes dirigidos a las propias interfaces IP locales del router
         if ip_pkt.dstip == PRIVATE_IP or ip_pkt.dstip == PUBLIC_IP:
-            log_color(YELLOW, f"Paquete IP dirigido al router ({ip_pkt.dstip}). Ignorado.")
+            log_color(YELLOW, f"[ROUTER] Paquete IP dirigido al router ({ip_pkt.dstip}). Ignorado.")
             return
 
         # Guardar valores originales antes de cualquier traducción in-place
@@ -146,8 +150,6 @@ class ProtoRouter(object):
 
         # Tráfico privada -> pública
         if original_srcip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
-            log_color(GREEN, f"MATCH: {original_srcip} pertenece a la red privada {PRIVATE_SUBNET}/{PRIVATE_MASK}")
-
             protocol = ip_pkt.protocol
             trans_pkt = ip_pkt.payload
 
@@ -175,7 +177,7 @@ class ProtoRouter(object):
                     # De lo contrario, asignar un nuevo puerto público libre
                     pub_port = self.obtener_prox_puerto(protocol, dst_ip, original_dstport)
                     if pub_port is None:
-                        log_color(RED, "[DROP] No hay puertos públicos de NAT disponibles.")
+                        log_color(RED, "[NAT-OUT] DROP: No hay puertos públicos de NAT disponibles.")
                         return
                     # Guardar la asignación bidireccional en las tablas de estado NAT
                     self.nat_saliente[key] = pub_port
@@ -188,7 +190,7 @@ class ProtoRouter(object):
                 elif protocol == ipv4.ICMP_PROTOCOL:
                     trans_pkt.payload.id = pub_port
 
-                log_color(GREEN, f"NAT Saliente: {original_srcip}:{original_srcport} → {PUBLIC_IP}:{pub_port} (para {dst_ip}:{original_dstport})")
+                log_color(GREEN, f"[NAT-OUT] Traduciendo: {original_srcip}:{original_srcport} -> {PUBLIC_IP}:{pub_port} (Destino: {dst_ip}:{original_dstport})")
             else:
                 # Si es otro protocolo, solo realizamos NAT básico de dirección IP
                 ip_pkt.srcip = PUBLIC_IP
@@ -206,15 +208,13 @@ class ProtoRouter(object):
                 self.enviar_paquete_ip(packet, PUBLIC_MAC, dst_mac, PUBLIC_PORT)
             else:
                 # No conocemos la MAC destino pública: encolar paquete y lanzar ARP Request
-                log_color(YELLOW, f"MAC de {dst_ip} desconocida. Encolando paquete y mandando ARP Request...")
+                log_color(YELLOW, f"[NAT-OUT] MAC de {dst_ip} desconocida. Encolando paquete...")
                 if dst_ip not in self.paquetes_esperando:
                     self.paquetes_esperando[dst_ip] = []
                     self.send_arp_request(dst_ip, PUBLIC_PORT)
                 self.paquetes_esperando[dst_ip].append(packet)
         else:
             # Tráfico Publica -> Privada
-            log_color(GREEN, f"MATCH (Entrante): {original_srcip} → {original_dstip} (público a privado)")
-
             protocol = ip_pkt.protocol
             trans_pkt = ip_pkt.payload
 
@@ -239,10 +239,12 @@ class ProtoRouter(object):
 
             # Si el destino no está mapeado en la tabla NAT, se descarta
             if ip_priv is None:
-                log_color(RED, f"NAT Drop: Tráfico entrante no solicitado a puerto/ID {original_srcport if protocol == ipv4.ICMP_PROTOCOL else original_dstport} de {original_srcip}")
+                puerto_or_id = original_srcport if protocol == ipv4.ICMP_PROTOCOL else original_dstport
+                log_color(RED, f"[NAT-IN] DROP: Tráfico entrante no solicitado de {original_srcip} al puerto NAT {puerto_or_id}")
                 return
 
-            log_color(GREEN, f"NAT Entrante: {original_srcip}:{original_srcport if protocol == ipv4.ICMP_PROTOCOL else original_dstport} → {ip_priv}:{port_priv}")
+            puerto_or_id = original_srcport if protocol == ipv4.ICMP_PROTOCOL else original_dstport
+            log_color(GREEN, f"[NAT-IN] Traduciendo: {original_srcip}:{puerto_or_id} -> {ip_priv}:{port_priv} (vía puerto NAT: {original_dstport})")
 
             # Reescribir header para re-envio a host de la privada
             ip_pkt.dstip = ip_priv
@@ -266,7 +268,7 @@ class ProtoRouter(object):
 
             else:
                 # No conocemos la MAC/puerto del host privado: encolar y buscar con ARP Request
-                log_color(YELLOW, f"MAC o puerto de host privado {ip_priv} desconocido. Encolando y enviando ARP Request...")
+                log_color(YELLOW, f"[NAT-IN] MAC de host privado {ip_priv} desconocida. Encolando paquete...")
                 if ip_priv not in self.paquetes_esperando:
                     self.paquetes_esperando[ip_priv] = []
                     target_port = out_port if out_port is not None else of.OFPP_FLOOD
@@ -278,12 +280,14 @@ class ProtoRouter(object):
         arp_pkt = packet.payload
         in_port = event.port
 
-        # Aprender dinámicamente la MAC del host que lanzó la ARP Request
-        self.tabla_arp[arp_pkt.protosrc] = arp_pkt.hwsrc
-        log_color(GREEN, f"ARP aprendido: {arp_pkt.protosrc} -> {arp_pkt.hwsrc}")
+        # Aprender dinámicamente la MAC del host que lanzó la ARP Request/Reply si es nueva o cambió
+        old_mac = self.tabla_arp.get(arp_pkt.protosrc)
+        if old_mac != arp_pkt.hwsrc:
+            self.tabla_arp[arp_pkt.protosrc] = arp_pkt.hwsrc
+            log_color(GREEN, f"[ARP] Aprendido: {arp_pkt.protosrc} -> {arp_pkt.hwsrc}")
 
         if arp_pkt.opcode == arp.REQUEST:
-            log_color(CYAN, f"ARP REQUEST recibido de {arp_pkt.protosrc} buscando {arp_pkt.protodst}")
+            log_color(CYAN, f"[ARP] Solicitud: ¿Quién tiene {arp_pkt.protodst}? (Preguntado por {arp_pkt.protosrc})")
 
             # Primero checkeo que sea para una IP del router/switch
             if arp_pkt.protodst == PRIVATE_IP:
@@ -291,7 +295,7 @@ class ProtoRouter(object):
             elif arp_pkt.protodst == PUBLIC_IP:
                 reply_mac = PUBLIC_MAC
             else:
-                log_color(YELLOW, f"ARP Request para IP no gestionada: {arp_pkt.protodst}")
+                log_color(YELLOW, f"[ARP] Solicitud para IP ajena ignorada: {arp_pkt.protodst}")
                 return
 
             # Armo el ARP Reply
@@ -314,16 +318,18 @@ class ProtoRouter(object):
             msg.data = e.pack()
             msg.actions.append(of.ofp_action_output(port=in_port))
             self.connection.send(msg)
-            log_color(GREEN, f"ARP REPLY enviado a {arp_pkt.protosrc}: {arp_pkt.protodst} es {reply_mac}")
+            log_color(GREEN, f"[ARP] Respondido: {arp_pkt.protodst} es {reply_mac} (Enviado a {arp_pkt.protosrc})")
 
         elif arp_pkt.opcode == arp.REPLY:
-            log_color(GREEN, f"ARP REPLY recibido de {arp_pkt.protosrc} ({arp_pkt.hwsrc})")
+            log_color(GREEN, f"[ARP] Respuesta: {arp_pkt.protosrc} es {arp_pkt.hwsrc}")
             
             # Si tenia paquetes a la espera de esta resolución de MACAddr, los mando
             if arp_pkt.protosrc in self.paquetes_esperando:
-                log_color(CYAN, f"Desencolando paquetes para {arp_pkt.protosrc}")
+                log_color(CYAN, f"[ARP] Enviando {len(self.paquetes_esperando[arp_pkt.protosrc])} paquetes encolados para {arp_pkt.protosrc}")
                 for pending_pkt in self.paquetes_esperando[arp_pkt.protosrc]:
                     ip_pkt = pending_pkt.payload
+                    protocol = ip_pkt.protocol
+                    trans_pkt = ip_pkt.payload
                     
                     # Decidir puerto de salida y MAC origen basándose en la red destino
                     if ip_pkt.dstip.inNetwork(PRIVATE_SUBNET, PRIVATE_MASK):
@@ -336,6 +342,19 @@ class ProtoRouter(object):
                         pending_pkt.src = PUBLIC_MAC
                         pending_pkt.dst = arp_pkt.hwsrc
                         out_port = PUBLIC_PORT
+                        
+                        # Si es TCP o UDP, instalar los flujos ahora que conocemos la MAC del servidor
+                        if protocol in (ipv4.TCP_PROTOCOL, ipv4.UDP_PROTOCOL):
+                            pub_port = trans_pkt.srcport
+                            dst_port = trans_pkt.dstport
+                            nat_key = (protocol, pub_port, ip_pkt.dstip, dst_port)
+                            if nat_key in self.nat_entrante:
+                                ip_priv, port_priv = self.nat_entrante[nat_key]
+                                mac_priv = self.tabla_arp.get(ip_priv)
+                                port_priv_sw = self.ip_to_port.get(ip_priv)
+                                if mac_priv is not None and port_priv_sw is not None:
+                                    self.instalar_flujo_saliente(protocol, ip_priv, port_priv, ip_pkt.dstip, dst_port, pub_port, mac_priv, port_priv_sw, arp_pkt.hwsrc)
+                                    self.instalar_flujo_entrante(protocol, ip_priv, port_priv, ip_pkt.dstip, dst_port, pub_port, mac_priv, port_priv_sw)
                     
                     if out_port is not None:
                         self.enviar_paquete_ip(pending_pkt, pending_pkt.src, pending_pkt.dst, out_port)
@@ -368,7 +387,7 @@ class ProtoRouter(object):
         msg.data = e.pack()
         msg.actions.append(of.ofp_action_output(port=out_port))
         self.connection.send(msg)
-        log_color(CYAN, f"ARP REQUEST enviado por puerto {out_port} buscando {target_ip}")
+        log_color(CYAN, f"[ARP] Solicitud Enviada: Buscando MAC de {target_ip} por puerto {out_port}")
 
     def _handle_FlowRemoved(self, event):
         match = event.ofp.match
@@ -387,7 +406,7 @@ class ProtoRouter(object):
                 ent_key = (protocol, pub_port, dst_ip, dst_port)
                 if ent_key in self.nat_entrante:
                     del self.nat_entrante[ent_key]
-                log_color(YELLOW, f"NAT Expired: {ip_priv}:{port_priv} → {dst_ip}:{dst_port} (pub_port {pub_port}) liberado por inactividad.")
+                log_color(YELLOW, f"[EXPIRADO] Flujo de salida inactivo: {ip_priv}:{port_priv} -> {dst_ip}:{dst_port} | Puerto NAT {pub_port} liberado.")
                 return
 
         # Si no, intentar remover por el flujo entrante
@@ -399,7 +418,7 @@ class ProtoRouter(object):
                 sal_key = (protocol, ip_priv, port_priv, match.nw_src, match.tp_src)
                 if sal_key in self.nat_saliente:
                     del self.nat_saliente[sal_key]
-                log_color(YELLOW, f"NAT Expired (reverso): {ip_priv}:{port_priv} → {match.nw_src}:{match.tp_src} (pub_port {match.tp_dst}) liberado por inactividad.")
+                log_color(YELLOW, f"[EXPIRADO] Flujo de entrada inactivo: {match.nw_src}:{match.tp_src} -> {PUBLIC_IP}:{match.tp_dst} | Reenvío a {ip_priv}:{port_priv} liberado.")
 
 
 
